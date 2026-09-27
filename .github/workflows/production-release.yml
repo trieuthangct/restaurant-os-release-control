@@ -1,0 +1,178 @@
+name: ROS production release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA on private codex/production-release branch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restaurant-os-production
+  cancel-in-progress: false
+
+env:
+  ROS_PRODUCTION_URL: https://restaurant-os.trieuthang-ins.workers.dev
+
+jobs:
+  candidate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production-candidate
+    outputs:
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      baseline_version: ${{ steps.identity.outputs.baseline_version }}
+      version_id: ${{ steps.identity.outputs.version_id }}
+      release_id: ${{ steps.identity.outputs.release_id }}
+    steps:
+      - name: Validate request and required secrets
+        env:
+          ROS_SOURCE_SHA: ${{ inputs.source_sha }}
+          ROS_SOURCE_TOKEN: ${{ secrets.ROS_SOURCE_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_UPLOAD_URL: ${{ secrets.VITE_UPLOAD_URL }}
+          VITE_UPLOAD_TOKEN: ${{ secrets.VITE_UPLOAD_TOKEN }}
+          VITE_VAPID_PUBLIC_KEY: ${{ secrets.VITE_VAPID_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$ROS_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'A full private source SHA is required'; exit 1; }
+          for name in ROS_SOURCE_TOKEN CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VITE_SUPABASE_URL VITE_SUPABASE_ANON_KEY VITE_UPLOAD_URL VITE_UPLOAD_TOKEN VITE_VAPID_PUBLIC_KEY; do
+            [[ -n "${!name}" ]] || { echo "Missing environment secret: $name"; exit 1; }
+          done
+      - name: Check private release guard and concurrent release runs
+        env:
+          GH_TOKEN: ${{ secrets.ROS_SOURCE_TOKEN }}
+          ROS_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          guard="$(gh api --method GET /repos/trieuthangct/restaurant-os/actions/workflows/ci-release-guard.yml/runs -f head_sha="$ROS_SOURCE_SHA" -f branch=codex/production-release -f per_page=30)"
+          jq -e --arg sha "$ROS_SOURCE_SHA" '[.workflow_runs[] | select(.head_sha == $sha and .event == "push" and .conclusion == "success")] | length > 0' <<< "$guard"
+          for workflow in production-release.yml production-rollback.yml; do
+            runs="$(gh api --method GET "/repos/trieuthangct/restaurant-os/actions/workflows/$workflow/runs" -f per_page=30)"
+            jq -e '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending")] | length == 0' <<< "$runs"
+          done
+      - uses: actions/checkout@v4
+        with:
+          repository: trieuthangct/restaurant-os
+          ref: codex/production-release
+          token: ${{ secrets.ROS_SOURCE_TOKEN }}
+          fetch-depth: 0
+      - name: Verify exact private branch head
+        env:
+          ROS_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$ROS_SOURCE_SHA" ]]
+          GITHUB_REF_NAME=codex/production-release GITHUB_SHA="$ROS_SOURCE_SHA" npm run release:worktree -- --ci
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run release:guard
+      - run: npm run test:release
+      - name: Build immutable candidate
+        env:
+          ROS_GIT_SHA: ${{ inputs.source_sha }}
+          ROS_RELEASE_ID: ros-${{ inputs.source_sha }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_UPLOAD_URL: ${{ secrets.VITE_UPLOAD_URL }}
+          VITE_UPLOAD_TOKEN: ${{ secrets.VITE_UPLOAD_TOKEN }}
+          VITE_VAPID_PUBLIC_KEY: ${{ secrets.VITE_VAPID_PUBLIC_KEY }}
+        run: |
+          node scripts/release/check-production-client-env.mjs
+          npm run build
+          node scripts/release/check-production-client-env.mjs --bundle dist
+      - name: Read active production version
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler deployments list --config wrangler.production.jsonc --json > deployments-before.json
+          node scripts/release/cloudflare-state.mjs active deployments-before.json > baseline-version.txt
+      - name: Upload candidate without traffic
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ROS_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          message="ROS_RELEASE:${ROS_SOURCE_SHA}"
+          npx wrangler versions upload --config wrangler.production.jsonc --strict --preview-alias ros-candidate --tag "ros-lkg-${ROS_SOURCE_SHA::12}" --message "$message"
+          npx wrangler versions list --config wrangler.production.jsonc --json > versions-after.json
+          node scripts/release/cloudflare-state.mjs find-message versions-after.json "$message" > candidate-version.txt
+      - name: Verify candidate preview
+        run: |
+          candidate_version="$(cat candidate-version.txt)"
+          candidate_prefix="${candidate_version%%-*}"
+          candidate_url="https://${candidate_prefix}-restaurant-os.trieuthang-ins.workers.dev"
+          node scripts/release/verify-release-endpoint.mjs "$candidate_url" "$candidate_version" 3
+      - id: identity
+        name: Publish candidate identity
+        env:
+          ROS_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          echo "source_sha=$ROS_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "baseline_version=$(cat baseline-version.txt)" >> "$GITHUB_OUTPUT"
+          echo "version_id=$(cat candidate-version.txt)" >> "$GITHUB_OUTPUT"
+          echo "release_id=ros-$ROS_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+  promote:
+    needs: candidate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate protected environment secrets
+        env:
+          ROS_SOURCE_TOKEN: ${{ secrets.ROS_SOURCE_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          for name in ROS_SOURCE_TOKEN CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            [[ -n "${!name}" ]] || { echo "Missing environment secret: $name"; exit 1; }
+          done
+      - uses: actions/checkout@v4
+        with:
+          repository: trieuthangct/restaurant-os
+          ref: codex/production-release
+          token: ${{ secrets.ROS_SOURCE_TOKEN }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Recheck private branch and other release runs
+        env:
+          GH_TOKEN: ${{ secrets.ROS_SOURCE_TOKEN }}
+          ROS_SOURCE_SHA: ${{ needs.candidate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$ROS_SOURCE_SHA" ]]
+          GITHUB_REF_NAME=codex/production-release GITHUB_SHA="$ROS_SOURCE_SHA" npm run release:worktree -- --ci
+          for workflow in production-release.yml production-rollback.yml; do
+            runs="$(gh api --method GET "/repos/trieuthangct/restaurant-os/actions/workflows/$workflow/runs" -f per_page=30)"
+            jq -e '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending")] | length == 0' <<< "$runs"
+          done
+      - name: Stop if another deployment changed production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler deployments list --config wrangler.production.jsonc --json > deployments-now.json
+          node scripts/release/cloudflare-state.mjs assert-active deployments-now.json "${{ needs.candidate.outputs.baseline_version }}"
+      - name: Promote the exact reviewed version
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler versions deploy "${{ needs.candidate.outputs.version_id }}@100%" --config wrangler.production.jsonc --message "${{ needs.candidate.outputs.release_id }}" --yes
+      - name: Verify production ten times without cache
+        run: node scripts/release/verify-release-endpoint.mjs "$ROS_PRODUCTION_URL" "${{ needs.candidate.outputs.version_id }}" 10
